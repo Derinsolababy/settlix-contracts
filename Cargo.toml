@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "contracts/payment",
+    "contracts/merchant_registry",
+    "contracts/settlement",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+soroban-sdk = "22.0.0"
