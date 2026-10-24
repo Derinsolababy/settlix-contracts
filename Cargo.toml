@@ -15,7 +15,7 @@ repository = "https://github.com/SETTLIX/settlix-contracts"
 rust-version = "1.84"
 
 [workspace.dependencies]
-soroban-sdk = "27.0.6"
+soroban-sdk = "29.0.1"
 shared = { path = "contracts/shared" }
 merchant-registry-contract = { path = "contracts/merchant_registry" }
 settlement-contract = { path = "contracts/settlement" }
