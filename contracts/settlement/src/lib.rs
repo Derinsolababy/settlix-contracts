@@ -1,173 +1,237 @@
+//! Settlement: the platform fee vault.
+//!
+//! The payment contract sends each invoice's platform fee here. Funds can
+//! only ever leave to the payout wallet the admin configured, so `sweep` is
+//! safe to leave permissionless: anyone (a cron job, a keeper) can trigger
+//! it, but nobody can choose where the money goes. This contract is also the
+//! single source of truth for the fee rate, which the payment contract reads.
+
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String};
 
+use shared::{extend_instance, MAX_FEE_BPS};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env,
+};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SettlementError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    InvalidFee = 3,
+    NothingToSweep = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub admin: Address,
+    pub payout_wallet: Address,
+    pub fee_bps: u32,
+}
+
+#[contracttype]
 #[derive(Clone)]
-#[contracttype]
-pub enum DataKey {
-    Settlement(u64),
-    MerchantBalance(Address),
-    Counter,
-    PlatformFee,
+enum DataKey {
+    Config,
 }
 
-#[contracttype]
+#[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Settlement {
-    pub id: u64,
-    pub merchant: Address,
-    pub amount: i128,
-    pub fee: i128,
-    pub net_amount: i128,
+pub struct FeesSwept {
+    #[topic]
     pub token: Address,
-    pub status: SettlementStatus,
-    pub created_at: u64,
-    pub settled_at: Option<u64>,
+    pub amount: i128,
+    pub to: Address,
 }
 
-#[contracttype]
+#[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SettlementStatus {
-    Pending,
-    Completed,
-    Failed,
+pub struct SettlementConfigured {
+    pub fee_bps: u32,
+    pub payout_wallet: Address,
 }
+
+soroban_sdk::contractmeta!(
+    key = "source_repo",
+    val = "github:SETTLIX/settlix-contracts"
+);
+soroban_sdk::contractmeta!(key = "desc", val = "Settlix platform fee vault");
 
 #[contract]
 pub struct SettlementContract;
 
 #[contractimpl]
 impl SettlementContract {
-    /// Initialize with platform fee (in basis points, e.g., 50 = 0.5%)
-    pub fn initialize(env: Env, platform_fee: u32) {
-        if env.storage().instance().has(&DataKey::PlatformFee) {
-            panic!("Already initialized");
-        }
-        
-        env.storage().instance().set(&DataKey::PlatformFee, &platform_fee);
-    }
-    
-    /// Create settlement for merchant
-    pub fn create_settlement(
+    /// One-time setup. The admin signs, so nobody can front-run
+    /// initialization with their own wallet.
+    pub fn initialize(
         env: Env,
-        merchant: Address,
-        amount: i128,
-        token: Address,
-    ) -> u64 {
-        merchant.require_auth();
-        
-        let platform_fee: u32 = env.storage().instance().get(&DataKey::PlatformFee).unwrap_or(50);
-        
-        // Calculate fee (amount * platform_fee / 10000)
-        let fee = (amount * platform_fee as i128) / 10000;
-        let net_amount = amount - fee;
-        
-        let counter = env.storage().instance().get(&DataKey::Counter).unwrap_or(0u64);
-        let settlement_id = counter + 1;
-        
-        let settlement = Settlement {
-            id: settlement_id,
-            merchant: merchant.clone(),
+        admin: Address,
+        payout_wallet: Address,
+        fee_bps: u32,
+    ) -> Result<(), SettlementError> {
+        if env.storage().instance().has(&DataKey::Config) {
+            return Err(SettlementError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        if fee_bps > MAX_FEE_BPS {
+            return Err(SettlementError::InvalidFee);
+        }
+        Self::save(
+            &env,
+            &Config {
+                admin,
+                payout_wallet,
+                fee_bps,
+            },
+        );
+        Ok(())
+    }
+
+    /// Sends this contract's whole balance of `token` to the payout wallet.
+    /// Permissionless: the destination is fixed by the admin.
+    pub fn sweep(env: Env, token_id: Address) -> Result<i128, SettlementError> {
+        let config = Self::config(&env)?;
+        let token = token::Client::new(&env, &token_id);
+        let amount = token.balance(&env.current_contract_address());
+        if amount <= 0 {
+            return Err(SettlementError::NothingToSweep);
+        }
+        token.transfer(
+            &env.current_contract_address(),
+            &config.payout_wallet,
+            &amount,
+        );
+        FeesSwept {
+            token: token_id,
             amount,
-            fee,
-            net_amount,
-            token: token.clone(),
-            status: SettlementStatus::Pending,
-            created_at: env.ledger().timestamp(),
-            settled_at: None,
-        };
-        
-        env.storage().persistent().set(&DataKey::Settlement(settlement_id), &settlement);
-        env.storage().instance().set(&DataKey::Counter, &settlement_id);
-        
-        env.events().publish(
-            (String::from_str(&env, "settlement_created"),),
-            (settlement_id, merchant, net_amount)
-        );
-        
-        settlement_id
-    }
-    
-    /// Execute settlement payout
-    pub fn execute_settlement(
-        env: Env,
-        settlement_id: u64,
-        platform_wallet: Address,
-    ) -> bool {
-        let mut settlement: Settlement = env.storage()
-            .persistent()
-            .get(&DataKey::Settlement(settlement_id))
-            .expect("Settlement not found");
-        
-        if settlement.status != SettlementStatus::Pending {
-            panic!("Settlement already processed");
+            to: config.payout_wallet,
         }
-        
-        let token_client = token::Client::new(&env, &settlement.token);
-        let contract_address = env.current_contract_address();
-        
-        // Transfer net amount to merchant
-        token_client.transfer(
-            &contract_address,
-            &settlement.merchant,
-            &settlement.net_amount,
-        );
-        
-        // Transfer fee to platform
-        token_client.transfer(
-            &contract_address,
-            &platform_wallet,
-            &settlement.fee,
-        );
-        
-        // Update settlement
-        settlement.status = SettlementStatus::Completed;
-        settlement.settled_at = Some(env.ledger().timestamp());
-        
-        env.storage().persistent().set(&DataKey::Settlement(settlement_id), &settlement);
-        
-        env.events().publish(
-            (String::from_str(&env, "settlement_completed"),),
-            (settlement_id, settlement.merchant.clone())
-        );
-        
-        true
+        .publish(&env);
+        Ok(amount)
     }
-    
-    /// Get settlement details
-    pub fn get_settlement(env: Env, settlement_id: u64) -> Settlement {
+
+    pub fn set_fee_bps(env: Env, fee_bps: u32) -> Result<(), SettlementError> {
+        if fee_bps > MAX_FEE_BPS {
+            return Err(SettlementError::InvalidFee);
+        }
+        let mut config = Self::config(&env)?;
+        config.admin.require_auth();
+        config.fee_bps = fee_bps;
+        Self::save(&env, &config);
+        Ok(())
+    }
+
+    /// Changing where fees go needs the admin and the new wallet to sign,
+    /// so a typo cannot send fees to an address nobody controls.
+    pub fn set_payout_wallet(env: Env, wallet: Address) -> Result<(), SettlementError> {
+        let mut config = Self::config(&env)?;
+        config.admin.require_auth();
+        wallet.require_auth();
+        config.payout_wallet = wallet;
+        Self::save(&env, &config);
+        Ok(())
+    }
+
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), SettlementError> {
+        let mut config = Self::config(&env)?;
+        config.admin.require_auth();
+        new_admin.require_auth();
+        config.admin = new_admin;
+        Self::save(&env, &config);
+        Ok(())
+    }
+
+    pub fn fee_bps(env: Env) -> u32 {
+        Self::config(&env).map(|c| c.fee_bps).unwrap_or(0)
+    }
+
+    pub fn get_config(env: Env) -> Result<Config, SettlementError> {
+        Self::config(&env)
+    }
+
+    pub fn balance(env: Env, token_id: Address) -> i128 {
+        token::Client::new(&env, &token_id).balance(&env.current_contract_address())
+    }
+
+    fn config(env: &Env) -> Result<Config, SettlementError> {
         env.storage()
-            .persistent()
-            .get(&DataKey::Settlement(settlement_id))
-            .expect("Settlement not found")
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(SettlementError::NotInitialized)
     }
-    
-    /// Get platform fee
-    pub fn get_platform_fee(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::PlatformFee).unwrap_or(50)
+
+    fn save(env: &Env, config: &Config) {
+        env.storage().instance().set(&DataKey::Config, config);
+        extend_instance(env);
+        SettlementConfigured {
+            fee_bps: config.fee_bps,
+            payout_wallet: config.payout_wallet.clone(),
+        }
+        .publish(env);
     }
 }
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Env};
+
+    fn setup() -> (Env, SettlementContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let c = SettlementContractClient::new(&env, &env.register(SettlementContract, ()));
+        let wallet = Address::generate(&env);
+        c.initialize(&Address::generate(&env), &wallet, &50);
+        let asset = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        (env, c, wallet, asset)
+    }
 
     #[test]
-    fn test_settlement_with_fee() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, SettlementContract);
-        let client = SettlementContractClient::new(&env, &contract_id);
-        
-        client.initialize(&50); // 0.5% fee
-        
-        let merchant = Address::generate(&env);
-        let token = Address::generate(&env);
-        
-        let settlement_id = client.create_settlement(&merchant, &10000, &token);
-        let settlement = client.get_settlement(&settlement_id);
-        
-        assert_eq!(settlement.amount, 10000);
-        assert_eq!(settlement.fee, 50); // 0.5% of 10000
-        assert_eq!(settlement.net_amount, 9950);
+    fn sweep_pays_only_the_configured_wallet() {
+        let (env, c, wallet, asset) = setup();
+        StellarAssetClient::new(&env, &asset).mint(&c.address, &1_234);
+        assert_eq!(c.sweep(&asset), 1_234);
+        assert_eq!(token::Client::new(&env, &asset).balance(&wallet), 1_234);
+        assert_eq!(
+            c.try_sweep(&asset),
+            Err(Ok(SettlementError::NothingToSweep))
+        );
+    }
+
+    #[test]
+    fn fee_is_capped_and_readable() {
+        let (_env, c, _wallet, _asset) = setup();
+        assert_eq!(c.fee_bps(), 50);
+        assert_eq!(
+            c.try_set_fee_bps(&(MAX_FEE_BPS + 1)),
+            Err(Ok(SettlementError::InvalidFee))
+        );
+        c.set_fee_bps(&100);
+        assert_eq!(c.fee_bps(), 100);
+    }
+
+    #[test]
+    fn initialize_once() {
+        let (env, c, wallet, _asset) = setup();
+        assert_eq!(
+            c.try_initialize(&Address::generate(&env), &wallet, &0),
+            Err(Ok(SettlementError::AlreadyInitialized))
+        );
+    }
+
+    #[test]
+    fn payout_wallet_change_moves_future_sweeps() {
+        let (env, c, _old, asset) = setup();
+        let new_wallet = Address::generate(&env);
+        c.set_payout_wallet(&new_wallet);
+        StellarAssetClient::new(&env, &asset).mint(&c.address, &10);
+        c.sweep(&asset);
+        assert_eq!(token::Client::new(&env, &asset).balance(&new_wallet), 10);
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "shared"
+description = "Fee math and storage TTL helpers shared by the Settlix contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

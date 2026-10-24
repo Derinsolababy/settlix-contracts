@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -14,3 +13,6 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+*.wasm
+.stellar/
+.env
